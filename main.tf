@@ -31,19 +31,6 @@ locals {
     }
     : {}
   )
-  lambda_endpoint = (
-    var.enable_lambda_endpoint
-    ? {
-      lambda = {
-        service             = "lambda"
-        private_dns_enabled = true
-        subnet_ids          = local.az_private_subnets
-        tags                = { Name = "lambda-vpc-endpoint" }
-      }
-    }
-    : {}
-  )
-  endpoints = merge(local.ec2_endpoint, local.lambda_endpoint)
 
   # Must provide exactly 1 EIP per AZ
   # var.nat_instance_eip_ids ignored if doesn't match AZ count
@@ -54,7 +41,6 @@ locals {
 resource "aws_eip" "nat_instance_eips" {
   count = local.reuse_nat_instance_eips ? 0 : length(var.vpc_az_maps)
 
-  vpc = true
   tags = merge(var.tags, {
     "Name" = "alternat-instance-${count.index}"
   })
@@ -174,6 +160,16 @@ data "cloudinit_config" "config" {
 
   gzip          = true
   base64_encode = true
+
+  dynamic "part" {
+    for_each = var.nat_instance_user_data_pre_install != "" ? [1] : []
+
+    content {
+      content_type = "text/x-shellscript"
+      content      = var.nat_instance_user_data_pre_install
+    }
+  }
+
   part {
     content_type = "text/x-shellscript"
     content = templatefile("${path.module}/alternat.conf.tftpl", {
@@ -181,9 +177,10 @@ data "cloudinit_config" "config" {
       route_table_ids_csv    = join(",", each.value)
     })
   }
+
   part {
     content_type = "text/x-shellscript"
-    content      = file("${path.module}/../../scripts/alternat.sh")
+    content      = file("${path.module}/scripts/alternat.sh")
   }
 
   dynamic "part" {
@@ -224,6 +221,8 @@ resource "aws_launch_template" "nat_instance_template" {
   image_id = var.nat_ami == "" ? data.aws_ami.amazon_linux_2.id : var.nat_ami
 
   instance_type = var.nat_instance_type
+
+  key_name = var.nat_instance_key_name
 
   metadata_options {
     http_endpoint               = "enabled"
@@ -281,6 +280,27 @@ resource "aws_security_group_rule" "nat_instance_ingress" {
   source_security_group_id = local.nat_instance_ingress_sgs[count.index]
 }
 
+resource "aws_security_group_rule" "nat_instance_ip_range_ingress" {
+  count = length(var.ingress_security_group_cidr_blocks) > 0 ? 1 : 0
+
+  type              = "ingress"
+  protocol          = "-1"
+  from_port         = 0
+  to_port           = 0
+  security_group_id = aws_security_group.nat_instance.id
+  cidr_blocks       = var.ingress_security_group_cidr_blocks
+}
+
+resource "aws_security_group_rule" "nat_instance_ipv6_range_ingress" {
+  count = length(var.ingress_security_group_ipv6_cidr_blocks) > 0 ? 1 : 0
+
+  type              = "ingress"
+  protocol          = "-1"
+  from_port         = 0
+  to_port           = 0
+  security_group_id = aws_security_group.nat_instance.id
+  ipv6_cidr_blocks  = var.ingress_security_group_ipv6_cidr_blocks
+}
 
 ### NAT instance IAM
 
@@ -394,7 +414,6 @@ resource "aws_eip" "nat_gateway_eips" {
     : obj.az => obj.public_subnet_id
     if var.create_nat_gateways
   }
-  vpc = true
   tags = merge(var.tags, {
     "Name" = "alternat-gateway-eip"
   })
@@ -425,7 +444,7 @@ locals {
 }
 
 resource "aws_security_group" "vpc_endpoint" {
-  count = length(local.endpoints) > 0 ? 1 : 0
+  count = length(local.ec2_endpoint) > 0 ? 1 : 0
 
   name_prefix = "ec2-vpc-endpoints-"
   description = "Allow TLS from the VPC CIDR to the AWS API."
@@ -451,13 +470,13 @@ resource "aws_security_group" "vpc_endpoint" {
 }
 
 module "vpc_endpoints" {
-  count = length(local.endpoints) > 0 ? 1 : 0
+  count = length(local.ec2_endpoint) > 0 ? 1 : 0
 
   source             = "terraform-aws-modules/vpc/aws//modules/vpc-endpoints"
   version            = "~> 3.14.0"
   vpc_id             = var.vpc_id
   security_group_ids = [aws_security_group.vpc_endpoint[0].id]
-  endpoints          = local.endpoints
+  endpoints          = local.ec2_endpoint
   tags               = var.tags
 }
 

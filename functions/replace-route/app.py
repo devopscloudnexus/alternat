@@ -27,8 +27,23 @@ DEFAULT_CONNECTIVITY_CHECK_INTERVAL = "5"
 # Which URLs to check for connectivity
 DEFAULT_CHECK_URLS = ["https://www.example.com", "https://www.google.com"]
 
-
+# The timeout for the connectivity checks.
 REQUEST_TIMEOUT = 5
+
+# Whether or not use IPv6.
+DEFAULT_HAS_IPV6 = True
+
+
+# Overrides socket.getaddrinfo to perform IPv4 lookups
+# See https://github.com/chime/terraform-aws-alternat/issues/87
+def disable_ipv6():
+    prv_getaddrinfo = socket.getaddrinfo
+    def getaddrinfo_ipv4(*args):
+        modified_args = (args[0], args[1], socket.AF_INET) + args[3:]
+        res = prv_getaddrinfo(*modified_args)
+        return res
+    socket.getaddrinfo = getaddrinfo_ipv4
+
 
 def get_az_and_vpc_zone_identifier(auto_scaling_group):
     autoscaling = boto3.client("autoscaling")
@@ -67,6 +82,11 @@ def get_vpc_id(route_table):
 
 
 def get_nat_gateway_id(vpc_id, subnet_id):
+    nat_gateway_id = os.getenv("NAT_GATEWAY_ID")
+    if nat_gateway_id:
+        logger.info("Using NAT_GATEWAY_ID env. variable (%s)", nat_gateway_id)
+        return nat_gateway_id
+
     try:
         nat_gateways = ec2_client.describe_nat_gateways(
             Filters=[
@@ -122,15 +142,20 @@ def replace_route(route_table_id, nat_gateway_id):
 def check_connection(check_urls):
     """
     Checks connectivity to check_urls. If any of them succeed, return success.
-    If both fail, replaces the route table to point at a standby NAT Gateway and
+    If all fail, replaces the route table to point at a standby NAT Gateway and
     return failure.
     """
     for url in check_urls:
         try:
-            urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT)
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', 'alternat/1.0')
+            urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
             logger.debug("Successfully connected to %s", url)
             return True
-        except (urllib.error.URLError, urllib.error.HTTPError) as error:
+        except urllib.error.HTTPError as error:
+            logger.warning("Response error from %s: %s, treating as success", url, error)
+            return True
+        except urllib.error.URLError as error:
             logger.error("error connecting to %s: %s", url, error)
         except socket.timeout as error:
             logger.error("timeout error connecting to %s: %s", url, error)
@@ -168,6 +193,10 @@ def connectivity_test_handler(event, context):
     check_interval = int(os.getenv("CONNECTIVITY_CHECK_INTERVAL", DEFAULT_CONNECTIVITY_CHECK_INTERVAL))
     check_urls = "CHECK_URLS" in os.environ and os.getenv("CHECK_URLS").split(",") or DEFAULT_CHECK_URLS
 
+    has_ipv6 = get_env_bool("HAS_IPV6", DEFAULT_HAS_IPV6)
+    if not has_ipv6:
+        disable_ipv6()
+
     # Run connectivity checks for approximately 1 minute
     run = 0
     num_runs = 60 / check_interval
@@ -177,6 +206,12 @@ def connectivity_test_handler(event, context):
             run += 1
         else:
             break
+
+
+def get_env_bool(var_name, default_value=False):
+    value = os.getenv(var_name, default_value)
+    true_values = ["t", "true", "y", "yes", "1"]
+    return str(value).lower() in true_values
 
 
 def handler(event, _):
